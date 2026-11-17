@@ -1,6 +1,7 @@
+use serde::Serialize;
 use std::time::Duration;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct PercentileStats {
     pub p50_ms: f64,
     pub p90_ms: f64,
@@ -8,7 +9,7 @@ pub struct PercentileStats {
     pub p99_ms: f64,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct BenchmarkReport {
     pub protocol: String,
     pub total_requests: usize,
@@ -69,6 +70,10 @@ impl BenchmarkReport {
         }
 
         Ok(())
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 }
 
@@ -173,5 +178,19 @@ mod tests {
 
         let rps_breach = SloCriteria { max_p99_ms: 60.0, max_failed_requests: 5, min_rps: 200.0 };
         assert_eq!(report.check_slo(&rps_breach).unwrap_err().reason, "throughput 100.00 req/s below floor 200.00 req/s");
+    }
+
+    #[test]
+    fn test_benchmark_report_to_json() {
+        let report = BenchmarkReport {
+            protocol: "REST".to_string(),
+            total_requests: 10,
+            successful_requests: 10,
+            failed_requests: 0,
+            total_duration: Duration::from_secs(1),
+            percentiles: PercentileStats { p50_ms: 5.0, p90_ms: 10.0, p95_ms: 15.0, p99_ms: 20.0 },
+        };
+        let json = report.to_json().unwrap();
+        assert!(json.contains("\"protocol\":\"REST\""));
     }
 }
