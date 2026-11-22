@@ -56,23 +56,6 @@ async fn run_worker(
     samples
 }
 
-fn aggregate_results(total_requests: usize, duration: Duration, results: Vec<(bool, Duration)>) -> BenchmarkReport {
-    let mut successful = 0;
-    let mut latencies = Vec::with_capacity(results.len());
-    for (ok, latency) in results {
-        if ok { successful += 1; }
-        latencies.push(latency);
-    }
-    BenchmarkReport {
-        protocol: "HTTP/1.1".to_string(),
-        total_requests,
-        successful_requests: successful,
-        failed_requests: total_requests.saturating_sub(successful),
-        total_duration: duration,
-        percentiles: crate::stats::PercentileStats::compute(&latencies),
-    }
-}
-
 pub async fn run_http_benchmark(config: &HttpBenchmarkConfig) -> BenchmarkReport {
     let (client, start) = (reqwest::Client::new(), Instant::now());
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(config.total_requests));
@@ -86,7 +69,7 @@ pub async fn run_http_benchmark(config: &HttpBenchmarkConfig) -> BenchmarkReport
             results.append(&mut worker_samples);
         }
     }
-    aggregate_results(config.total_requests, start.elapsed(), results)
+    BenchmarkReport::from_samples("HTTP/1.1", config.total_requests, start.elapsed(), &results)
 }
 
 #[cfg(test)]

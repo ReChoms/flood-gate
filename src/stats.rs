@@ -32,6 +32,23 @@ pub struct SloBreach {
 }
 
 impl BenchmarkReport {
+    pub fn from_samples(protocol: &str, total_requests: usize, total_duration: Duration, samples: &[(bool, Duration)]) -> Self {
+        let mut successful_requests = 0;
+        let mut latencies = Vec::with_capacity(samples.len());
+        for &(is_ok, latency) in samples {
+            if is_ok { successful_requests += 1; }
+            latencies.push(latency);
+        }
+        Self {
+            protocol: protocol.to_string(),
+            total_requests,
+            successful_requests,
+            failed_requests: total_requests.saturating_sub(successful_requests),
+            total_duration,
+            percentiles: PercentileStats::compute(&latencies),
+        }
+    }
+
     pub fn throughput_rps(&self) -> f64 {
         let duration_secs = self.total_duration.as_secs_f64();
         if duration_secs <= 0.0 {
