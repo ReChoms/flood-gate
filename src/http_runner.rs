@@ -1,5 +1,8 @@
+use crate::pacer::await_scheduled_turn;
 use crate::stats::BenchmarkReport;
-use std::time::{Duration, Instant};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct HttpBenchmarkConfig {
@@ -27,49 +30,70 @@ fn build_request(
     }
 }
 
-async fn execute_timed_request(builder: reqwest::RequestBuilder) -> (bool, Duration) {
-    let start = Instant::now();
-    let is_ok = builder.send().await.map_or(false, |resp| resp.status().is_success());
-    (is_ok, start.elapsed())
-}
-
-fn create_pacer(target_rps: Option<u32>, concurrency: usize) -> Option<tokio::time::Interval> {
-    let rps = target_rps?;
-    let worker_rps = (rps as f64 / concurrency.max(1) as f64).max(0.001);
-    Some(tokio::time::interval(Duration::from_secs_f64(1.0 / worker_rps)))
+async fn execute_timed_request(
+    request_builder: reqwest::RequestBuilder,
+    scheduled_start: Instant,
+) -> (bool, Duration) {
+    let request_succeeded = request_builder
+        .send()
+        .await
+        .map_or(false, |http_response| http_response.status().is_success());
+    (request_succeeded, scheduled_start.elapsed())
 }
 
 async fn run_worker(
-    client: reqwest::Client,
-    config: HttpBenchmarkConfig,
-    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    http_client: reqwest::Client,
+    benchmark_settings: HttpBenchmarkConfig,
+    next_request_index: Arc<AtomicUsize>,
+    benchmark_epoch: Instant,
 ) -> Vec<(bool, Duration)> {
-    let mut samples = Vec::new();
-    let mut ticker = create_pacer(config.target_rps, config.concurrency);
-    while counter.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
-        if let Some(ref mut interval) = ticker {
-            interval.tick().await;
+    let mut latency_samples = Vec::new();
+    loop {
+        let request_index = next_request_index.fetch_add(1, Ordering::Relaxed);
+        if request_index >= benchmark_settings.total_requests {
+            break;
         }
-        let req = build_request(&client, &config.url, &config.method, config.body.as_deref());
-        samples.push(execute_timed_request(req).await);
+        let scheduled_start = await_scheduled_turn(
+            benchmark_epoch,
+            request_index,
+            benchmark_settings.target_rps,
+        )
+        .await;
+        let http_request = build_request(
+            &http_client,
+            &benchmark_settings.url,
+            &benchmark_settings.method,
+            benchmark_settings.body.as_deref(),
+        );
+        latency_samples.push(execute_timed_request(http_request, scheduled_start).await);
     }
-    samples
+    latency_samples
 }
 
-pub async fn run_http_benchmark(config: &HttpBenchmarkConfig) -> BenchmarkReport {
-    let (client, start) = (reqwest::Client::new(), Instant::now());
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(config.total_requests));
-    let mut handles = Vec::with_capacity(config.concurrency);
-    for _ in 0..config.concurrency.max(1) {
-        handles.push(tokio::spawn(run_worker(client.clone(), config.clone(), counter.clone())));
+pub async fn run_http_benchmark(benchmark_settings: &HttpBenchmarkConfig) -> BenchmarkReport {
+    let (http_client, benchmark_epoch) = (reqwest::Client::new(), Instant::now());
+    let next_request_index = Arc::new(AtomicUsize::new(0));
+    let mut worker_handles = Vec::with_capacity(benchmark_settings.concurrency);
+    for _ in 0..benchmark_settings.concurrency.max(1) {
+        worker_handles.push(tokio::spawn(run_worker(
+            http_client.clone(),
+            benchmark_settings.clone(),
+            next_request_index.clone(),
+            benchmark_epoch,
+        )));
     }
-    let mut results = Vec::with_capacity(config.total_requests);
-    for handle in handles {
-        if let Ok(mut worker_samples) = handle.await {
-            results.append(&mut worker_samples);
+    let mut all_latency_samples = Vec::with_capacity(benchmark_settings.total_requests);
+    for worker_handle in worker_handles {
+        if let Ok(mut worker_samples) = worker_handle.await {
+            all_latency_samples.append(&mut worker_samples);
         }
     }
-    BenchmarkReport::from_samples("HTTP/1.1", config.total_requests, start.elapsed(), &results)
+    BenchmarkReport::from_samples(
+        "HTTP/1.1",
+        benchmark_settings.total_requests,
+        benchmark_epoch.elapsed(),
+        &all_latency_samples,
+    )
 }
 
 #[cfg(test)]
@@ -131,5 +155,63 @@ mod tests {
         let report = run_http_benchmark(&config).await;
         assert_eq!(report.successful_requests, 4);
         assert!(report.total_duration >= Duration::from_millis(120));
+    }
+
+    async fn spawn_http_mock(count: usize, first_delay: Duration) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for i in 0..count {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 512];
+                    let _ = socket.read(&mut buf).await;
+                    if i == 0 && !first_delay.is_zero() {
+                        tokio::time::sleep(first_delay).await;
+                    }
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_http_runner_coordinated_omission() {
+        let addr = spawn_http_mock(3, Duration::from_millis(150)).await;
+        let config = HttpBenchmarkConfig {
+            url: format!("http://{addr}"),
+            method: "GET".to_string(),
+            body: None,
+            total_requests: 3,
+            concurrency: 1,
+            target_rps: Some(20),
+        };
+        let report = run_http_benchmark(&config).await;
+        assert_eq!(report.successful_requests, 3);
+        assert!(
+            report.percentiles.p50_ms >= 50.0,
+            "expected p50 >= 50ms, got {}",
+            report.percentiles.p50_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_runner_uniform_pacing_across_workers() {
+        let addr = spawn_http_mock(4, Duration::ZERO).await;
+        let config = HttpBenchmarkConfig {
+            url: format!("http://{addr}"),
+            method: "GET".to_string(),
+            body: None,
+            total_requests: 4,
+            concurrency: 4,
+            target_rps: Some(20),
+        };
+        let report = run_http_benchmark(&config).await;
+        assert_eq!(report.successful_requests, 4);
+        assert!(
+            report.total_duration >= Duration::from_millis(130),
+            "expected >= 130ms, got {:?}",
+            report.total_duration
+        );
     }
 }
